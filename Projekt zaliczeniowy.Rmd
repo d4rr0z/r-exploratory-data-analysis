@@ -1,0 +1,489 @@
+---
+title: "Projekt zaliczeniowy"
+author: "Dariusz Rozycki"
+date: "2023-12-02"
+output: 
+  html_document:
+    theme: bootstrap
+    highlight: tango
+    toc: true
+    toc_float: true
+---
+
+# Wprowadzenie
+
+Zbiór danych zawiera informacje dotyczące zatrzymań drogowych dokonanych przez policję na przestrzeni kilku lat w rejonie San Francisco. Jeden wiersz to jedno zatrzymanie. Dane zostały pobrane ze strony:
+https://openpolicing.stanford.edu/data/
+
+## Zmienne (już po modyfikacjach)
+
+* **Data** (Date)
+* **Szerokość geograficzna** (num)
+* **Długość geograficzna** (num)
+* **Wiek** (int)
+* **Rasa** (Factor: white, asian/pacific islander, black, hispanic, other)
+* **Płeć** (Factor: female, male)
+* **Rezultat zatrzymania** (Factor: warning, citation, arrest)
+* **Znaleziona kontrabanda** (Factor: no_search, FALSE, TRUE)
+* **Kontrola osobista** (Factor: FALSE, TRUE)
+* **Przeszukanie pojazdu** (Factor: FALSE, TRUE)
+* **Pora dnia** (Factor: morning, afternoon, evening, night)
+
+## Wykorzystywane pakiety
+
+```{r message = FALSE, warning = FALSE}
+library(tidyverse)
+library(mice)
+library(rmarkdown)
+library(maps)
+```
+
+# Zapoznanie z danymi
+
+## Wczytanie pliku
+
+```{r}
+data <- read.csv("ca_san_francisco_2020_04_01.csv", sep = ",")
+```
+
+## Sprawdzenie kilku pierwszych
+
+```{r}
+paged_table(head(data, 10))
+```
+
+## ... i kilku ostatnich wartości
+
+```{r}
+paged_table(tail(data, 10))
+```
+
+## Poznanie struktury danych
+
+```{r}
+str(data)
+```
+
+Przede wszystkim jest tu sporo zmiennych do niczego mi niepotrzebnych. Do tego trzeba będzie pozmieniać typy niektórych zmiennych oraz część samych nazw zmiennych. Rzucają się również w oczy braki danych.
+
+## Modyfikacja struktury I
+
+Zacznę od usunięcia niechcianych zmiennych.
+
+```{r}
+data <- subset(data, select = -c(raw_result_of_contact_description,
+                                 raw_search_vehicle_description,
+                                 raw_row_number, arrest_made,
+                                 reason_for_stop, search_basis,
+                                 citation_issued, warning_issued, type,
+                                 location, district))
+```
+
+Następnie, dla wygody, zmienię nazwy kilku zmiennych.
+
+```{r}
+data <- data %>%
+  rename(latitude = lat, longitude = lng, age = subject_age,
+         sex = subject_sex, race = subject_race)
+```
+
+Zanim pozmieniam typy poszczególnych zmiennych, chciałbym się zorientować, jak wygląda sytuacja z brakującymi wartościami. Danych jest dużo, dlatego myślę o usunięciu wierszy z brakami.
+
+## Braki danych
+
+```{r}
+md.pattern(data, rotate.names = TRUE)
+```
+
+No i pozbawiłbym się grubo ponad 90% danych... Widzę, że problem leży głównie w zmiennej *contraband_found*.
+
+```{r}
+sum(is.na(data$contraband_found))
+```
+
+Sprawdzam zmienne *search_vehicle* i *search_conducted*, które w oczywisty sposób są powiązane ze zmienną *contraband_found*. Na szczęście nie mają żadnych braków.
+
+```{r}
+sum(!data$search_vehicle)
+sum(!data$search_conducted)
+```
+
+No tak, raczej cieżko by było znaleźć coś, nie przeszukawszy wcześniej miejsca, w którym to coś się znajduje... Przy okazji dowiadujemy się, że kontrola osobista zawsze przebiega wraz z przeszukaniem pojazdu. W każdym razie zmieniam brakujące wartości w zmiennej *contraband_found* na napis "no_search".
+
+```{r}
+data$contraband_found[which(is.na(data$contraband_found))] = "no_search"
+```
+
+Teraz spokojnie mogę usunąć pozostałe rekordy z brakami (w końcu to tylko kilka % wszystkich danych).
+
+```{r}
+data <- na.omit(data)
+```
+
+Sprawdzę jeszcze, czy na pewno nie mam już brakujących wartości i wracam do modyfikacji struktury danych.
+
+```{r}
+md.pattern(data, rotate.names = TRUE)
+```
+
+## Modyfikacja struktury II
+
+Zmieniam typy wybranych zmiennych (głównie logicznych i character na factor) oraz nadaję kolejność poziomów niektórym z nich.
+
+```{r}
+data$date <- as.Date(data$date)
+data$race <- factor(data$race, 
+                    levels = c("white", "asian/pacific islander", "black",
+                               "hispanic", "other"))
+data$sex <- factor(data$sex, levels = c("male", "female"))
+data$outcome <- factor(data$outcome, 
+                       levels = c("citation", "warning", "arrest"))
+data$contraband_found <- factor(data$contraband_found, 
+                                levels = c("no_search", "FALSE", "TRUE"))
+data$search_conducted <- factor(data$search_conducted, 
+                                levels = c("FALSE", "TRUE"))
+data$search_vehicle <- factor(data$search_vehicle, 
+                              levels = c("FALSE", "TRUE"))
+```
+
+Zmienną *time* postanawiam wykorzystać do stworzenia nowej zmiennej *time_of_day*.
+
+```{r}
+data$time <- as.POSIXct(data$time, format = "%H:%M:%S")
+help <- as.POSIXct(c("06:00:00", "12:00:00", "18:00:00", "24:00:00"), 
+                   format = "%H:%M:%S")
+data <- data %>%
+  mutate(time_of_day = case_when(time >= help[1] & time < help[2] ~ "morning", 
+                                 time >= help[2] & time < help[3] ~ "afternoon", 
+                                 time >= help[3] & time < help[4] ~ "evening", 
+                                 TRUE ~ "night"))
+```
+
+Nowej zmiennej zmieniam od razu typ na kategoryczny i nadaję odpowiednią kolejność poziomów, oraz pozbywam się zmiennej *time* - spełniła już swoje zadanie.
+
+```{r}
+data$time_of_day <- factor(data$time_of_day, 
+                           levels = c("morning", "afternoon", "evening", "night"))
+data <- subset(data, select = -time)
+```
+
+Na koniec wyświetlam statystyki opisowe dla gotowego do analizy zestawu danych.
+
+```{r}
+summary(data)
+```
+
+Jak widać ewentualne wartości odstające są całkowicie pomijalne (np. wartość maksymalna w zmiennej *longitude*).
+
+# Badanie zależności między zmiennymi
+
+## Zatrzymania
+
+Na początku sprawdzam jaki odsetek zatrzymań stanowią kobiety, a jaki mężczyźni.
+
+```{r}
+prop.table(table(data$sex))
+```
+
+Czy rasa kierowcy zmienia jakoś te proporcje?
+
+```{r}
+prop.table(table(data$race, data$sex), 1)
+```
+
+W przypadku Azjatów i osób czarnych oraz z rejonów Oceanii nie widać większych zmian. Największe różnice można zaobserwować u Latynosów i osób, których rasa została określona jako "other", gdzie wyraźnie większy odsetek mężczyzn zostaje zatrzymany przez policję. Z kolei u rasy białej to większy odsetek kobiet zostaje zatrzymany do kontroli.
+
+Zobaczmy może jeszcze jakiej rasy są zatrzymywane osoby.
+
+```{r}
+prop.table(table(data$race, data$sex), 2)
+```
+
+Pewnie można by było coś ciekawego tutaj napisać, ale opieram się wyłącznie na wybranym zestawie danych, w którym nie ma żadnych informacji odnośnie demografii rejonu San Francisco.
+
+## Wiek zatrzymanych
+
+Teraz sprawdzę w jakim wieku są zatrzymywane osoby (od razu z podziałem na płeć).
+
+```{r}
+data %>%
+  ggplot(aes(x = age, fill = sex)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Wiek zatrzymanych osób z podziałem na płeć",
+       x = "wiek",
+       y = "gęstość",
+       fill = "płeć")
+```
+
+Obydwa rozkłady są do siebie bardzo podobne, a zatrzymywane są głównie osoby do 50 roku życia. Potwierdzę to jeszcze wyznaczając kilka statystyk opisowych i rysując odpowiednie wykresy pudełkowe.
+
+```{r}
+data %>%
+  group_by(sex) %>%
+  summarise(srednia = mean(age),
+            mediana = median(age),
+            odchylenie_standardowe = sd(age),
+            rozstep_cwiartkowy = IQR(age))
+
+data %>%
+  ggplot(aes(x = age, fill = sex)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Wiek zatrzymanych osób z podziałem na płeć",
+       x = "wiek",
+       fill = "płeć")
+```
+
+Tutaj wyraźnie widać, że osoby do 50 roku życia stanowią ponad 75% wszystkich zatrzymań. Czy rasa w tym wypadku coś zmienia?
+
+```{r}
+data %>%
+  ggplot(aes(x = age, fill = sex)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  facet_wrap(~ race) +
+  labs(title = "Wiek zatrzymanych osób w zależności od płci z podziałem na rasy",
+       x = "wiek",
+       y = "gęstość",
+       fill = "płeć")
+```
+
+Ciężko powiedzieć. Wyznaczę kilka statystyk opisowych w zależności od rasy dla każdej płci osobno.
+
+```{r}
+data %>%
+  filter(sex == "male") %>%
+  group_by(race) %>%
+  summarise(srednia = mean(age),
+            mediana = median(age),
+            odchylenie_standardowe = sd(age),
+            rozstep_cwiartkowy = IQR(age))
+
+data %>%
+  filter(sex == "female") %>%
+  group_by(race) %>%
+  summarise(srednia = mean(age),
+            mediana = median(age),
+            odchylenie_standardowe = sd(age),
+            rozstep_cwiartkowy = IQR(age))
+```
+
+Między płciami różnice występują, ale są raczej niewielkie. Jeżeli chodzi o rasy to średnio najstarsi są Azjaci, osoby z rejonów Oceanii oraz białe. Średnio najmłodsi są Latynosi i osoby czarne, a osoby określone jako "other", znajdują się gdzieś pomiędzy tymi grupami.
+
+## Wynik zatrzymania
+
+Zajmę się teraz zmienną *outcome* i jej związkami z pozostałymi zmiennymi. Zacznę od sprawdzenia zależności między płcią, a wynikiem zatrzymania.
+
+```{r}
+data %>%
+  ggplot(aes(x = sex, fill = outcome)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Rezultat zatrzymania w zależności od płci",
+       x = "płeć",
+       y = "odsetek",
+       fill = "rezultat")
+```
+
+Poza większym odestkiem aresztowań mężczyzn, nie ma innych istotnych różnic. W przypadku obydwu płci około 70% zatrzymań kończy się mandatem, a coś między 25-30% ostrzeżeniem. Sprawdźmy to dokładniej.
+
+```{r}
+prop.table(table(data$sex, data$outcome), 1)
+
+prop.table(table(data$sex, data$outcome), 2)
+```
+
+Mężczyźni byli aresztowani częściej o około 67% oraz stanowili prawie 80% wszystkich aresztowań. Zobaczmy jak to wygląda z podziałem na rasy.
+
+```{r}
+data %>%
+  ggplot(aes(x = sex, fill = outcome)) +
+  geom_bar(color = "white", 
+           position = "fill") +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  facet_wrap(~ race) +
+  labs(title = "Rezultat zatrzymania w zależności od płci z podziałem na rasy",
+     x = "płeć",
+     y = "odsetek",
+     fill = "rezultat")
+```
+
+Najbardziej rzuca się w oczy zdecydowanie większy odsetek osób czarnych dostających tylko ostrzeżenia. Widać też, że największy odsetek aresztowań ma miejsce przy zatrzymaniach mężczyzn tej rasy. Najwięcej zatrzymań kończy się mandatem (ponad 75%) w przypadku Azjatów, osób z rejonów Oceanii i tych zaklasyfikowanych jako "other".
+
+Sprawdzę jeszcze jak wygląda sytuacja w zależności od rasy z podziałem na płcie.
+
+```{r}
+data %>%
+  ggplot(aes(x = sex, fill = race)) +
+  geom_bar(color = "white", 
+           position = "fill") +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  facet_wrap(~ outcome) +
+  labs(title = "Rezultat zatrzymania w zależności od rasy z podziałem na płcie",
+     x = "płeć",
+     y = "odsetek",
+     fill = "rasa")
+```
+
+Kobiety rasy białej stanowią większy odsetek wszystkich wyników zatrzymań wśród kobiet, niż biali mężczyźni wśród mężczyzn. Równoważy to większy odsetek Latynosów i "innych" wśród mężczyzn w stosunku do odestka kobiet swoich grup wśród wszystkich kobiet. Największa dysproporcja między płciami występuje w przypadku aresztowań Latynosów.
+
+Czy wiek odgrywa tutaj jakąś istotną rolę?
+
+```{r}
+data %>%
+  ggplot(aes(x = outcome, y = age, fill=outcome)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Wiek kierowców w zależności od wyniku zatrzymania",
+     x = "rezultat",
+     y = "wiek")
+  
+data %>%
+  ggplot(aes(x = outcome, y = age, fill=outcome)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  facet_wrap(~ sex) +
+  labs(title = "Wiek kierowców w zależności od wyniku zatrzymania z podziałem na płcie",
+     x = "rezultat",
+     y = "wiek")
+
+data %>%
+  ggplot(aes(x = outcome, y = age, fill=outcome)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  facet_wrap(~ race) +
+  labs(title = "Wiek kierowców w zależności od wyniku zatrzymania z podziałem na rasy",
+     x = "rezultat",
+     y = "wiek")
+```
+
+Nie widać tutaj jakichś specjalnych różnic. Co można powiedzieć na pewno, to to, że osoby aresztowane są średnio najmłodsze, a osoby dostające mandat średnio najstarsze.
+
+## Przeszukiwanie zatrzymanych
+
+Czas najwyższy zająć się zmiennymi *search_conducted* i *contrabound_found* (jak już zostało ustalone zmienne *search_conducted* i *search_vehicle* zawierają dokładnie to samo). Kto był częściej przeszukiwany - kobiety czy mężczyźni?
+
+```{r}
+prop.table(table(data$sex, data$search_conducted), 1)
+
+prop.table(table(data$sex, data$search_conducted), 2)
+```
+
+Widać, że mężczyźni byli przeszukiwani ponad dwa razy częściej od kobiet. Jednocześnie prawie 84% wszystkich przeszukań dotyczyło mężczyzn. U kogo częściej znajdowano kontrabandę?
+
+```{r}
+data %>%
+  group_by(sex) %>%
+  summarise(contraband_rate = sum(contraband_found == "TRUE") / length(contraband_found))
+```
+
+Proporcje się zmieniły. W sumie to należałoby sprawdzić czy przeszukania były uzasadnione tj. jaki odsetek przeszukań zakończył się znalezieniem kontrabandy.
+
+```{r}
+data %>%
+  group_by(sex) %>%
+  summarise(success_rate = sum(contraband_found == "TRUE") / sum(search_conducted == "TRUE"))
+```
+
+Okazuje się, że przeszukania kobiet były wyraźnie bardziej uzasadnione. Zobaczmy jak to wygląda w zależności od rasy.
+
+```{r}
+prop.table(table(filter(data, search_conducted == "TRUE")$race))
+```
+
+Osoby czarne stanowią zdecydowanie największy odsetek przeszukiwanych osób - ponad 46%. Czy słusznie?
+
+```{r}
+data %>%
+  group_by(race) %>%
+  summarise(success_rate = sum(contraband_found == "TRUE") / sum(search_conducted == "TRUE"))
+```
+
+Wygląda na to, że nie - u osób czarnych najrzadziej znajduje się kontrabandę. Dla równowagi największy odsetek sukcesów odnotowuje się u osób najrzadziej przeszukiwanych - Azjatów i z Oceanii. Szkoda, że w danych nie było jakichś informacji odnośnie samych kontraband. 
+
+## Data i pora dnia zatrzymania
+
+Mam jeszcze kilka zmiennych, których nie ruszyłem. Zobaczmy jak zmieniała się liczba zatrzymań w kolejnych latach.
+
+```{r}
+data %>%
+  ggplot(aes(x = date)) +
+  geom_density(color = "blue", linewidth = 1.5) +
+  theme_light() +
+  labs(title = "Zatrzymania na przestrzeni lat",
+     x = "rok",
+     y = "gęstość")
+```
+
+Poza silnym spadkiem w 2014 roku nie ma tu w zasadzie niczego interesującego. Za mały okres żeby wyciągnąć jakieś fajne wnioski.
+
+Kontynuując, o jakiej porze dnia ma miejsce najwięcej zatrzymań?
+
+```{r}
+data %>%
+  ggplot(aes(x = time_of_day)) +
+  geom_bar(color = "gold4", fill = "gold") +
+  theme_light() +
+  labs(title = "Zatrzymania w zależności od pory dnia",
+       x = "pora dnia",
+       y = "zatrzymania")
+```
+
+Zdecydowanie najwięcej zatrzymań ma miejsce po południu i wieczorami, co oczywiście na sens - ludzie wracają do domów po pracy czy innych wieczornych rozrywkach. Ciekawe czy jest jakaś zależność między porą dnia a wynikiem zatrzymania.
+
+```{r}
+data %>%
+  ggplot(aes(x = time_of_day, fill = outcome)) +
+  geom_bar(position = "fill", color = "white") +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Rezultat zatrzymania w zależności od pory dnia",
+       x = "pora dnia",
+       y = "odsetek",
+       fill = "rezultat")
+```
+
+Okazuje się, że im późniejsza pora, tym więcej ostrzeżen i aresztowań. Sprawdzę jeszcze zależność pory dnia od rasy kierowcy.
+
+```{r}
+data %>%
+  ggplot(aes(x = time_of_day, fill = race)) +
+  geom_bar(color = "white", position = "dodge2") +
+  scale_fill_brewer(palette="Set1") +
+  theme_light() +
+  labs(title = "Pora dnia, a rasa zatrzymanego kierowcy",
+       x = "pora dnia",
+       y = "zatrzymania",
+       fill = "rasa")
+```
+
+Pomijając osoby białe, najwięcej zatrzymań rano i po południu dotyczy Azjatów i osób z rejonów Oceanii, a wieczorem i w nocy osób czarnych.
+
+## Miejsce zatrzymania
+
+Wykorzystajmy jeszcze jakoś koordynaty zatrzymań.
+
+```{r}
+map_data("state") %>%
+  filter(region == "california") %>%
+  ggplot(aes(x = long, y = lat)) +
+  theme_light() +
+  coord_quickmap(xlim = c(-122.6, -122.2),  ylim = c(37.6, 37.9)) +
+  geom_polygon(color = "black", fill = "lightgray") +
+  geom_point(data, mapping = aes(x = longitude, y = latitude), alpha = 0.1) +
+  labs(title = "San Francisco",
+      x = "długość geograficzna",
+      y = "szerokość geograficzna")
+```
+
+No tak, nie wiem czego się spodziewałem... Ale szkoda usuwać, zwłaszcza, że kilka minut trwa nakładanie wszystkich punktów (które swoją drogą wydają się być przesunięte w lewą stronę) na mapę (albo to mapa jest przesunięta względem punktów na prawo).
